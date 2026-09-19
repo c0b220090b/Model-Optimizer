@@ -1,0 +1,29 @@
+# --- コア ---
+torch>=2.1
+transformers>=4.44
+accelerate>=0.33
+diffusers>=0.29
+datasets>=2.20
+peft>=0.12
+numpy
+
+# --- NVIDIA TensorRT Model Optimizer ---
+# AWQ / SmoothQuant / FP8 / KVキャッシュ量子化 / 2:4構造化スパース(Magnitude, SparseGPT) /
+# 知識蒸留 / Medusaベース Speculative Decoding / 拡散モデル(U-Net/TextEncoder/VAE)PTQ で使用
+nvidia-modelopt[hf]>=0.27
+
+# --- 量子化（modelopt の対象外の手法） ---
+bitsandbytes>=0.43   # bitsandbytes INT8/NF4 (bitsandbytes独自の量子化フォーマット)
+gptqmodel>=1.7        # GPTQ (modeloptには未実装のアルゴリズム)
+optimum>=1.21
+
+# --- 枝刈り（modeloptの対象外の手法: 任意スパース率, 構造化ブロック除去等） ---
+torch-pruning>=1.4   # U-Netチャンネルプルーニング (modeloptのFastNASはCV分類モデル向けが中心)
+# nvidia-apex         # (参考) 2:4構造化スパースの別実装。本プロジェクトではmodelopt側を採用
+
+# --- 拡散モデル関連 ---
+tomesd>=0.1.3         # Token Merging
+open_clip_torch        # CLIP Score計算(サンプラー比較)
+
+# --- GGUF量子化 ---
+# llama.cpp は別途 git clone してビルドが必要 (scripts/quantization/05_gguf_quant.sh 参照)
