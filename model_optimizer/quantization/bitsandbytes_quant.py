@@ -1,9 +1,10 @@
 """
 1-1. bitsandbytes INT8 / NF4 量子化（PTQ, 重みのみ）
 最も手軽な量子化のベースライン。キャリブレーション不要でロード時に量子化される。
+評価は他の手法と同じ WikiText-2 test（seqlen=2048）の Perplexity。
 
 使用例:
-  python bitsandbytes_quant.py \
+  python quantization/bitsandbytes_quant.py \
     --model_path meta-llama/Llama-3.1-8B-Instruct \
     --dtype nf4 \
     --output_dir ./output/llama3.1-8b-bnb-nf4
@@ -11,8 +12,8 @@
 import sys, os, argparse
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "common"))
 from model_utils import (load_llm, get_model_size_mb, get_num_params,
-                          measure_llm_latency, measure_perplexity,
-                          default_calibration_texts, save_results, common_output_args)
+                          measure_llm_latency, measure_perplexity_wikitext,
+                          save_results, common_output_args, common_eval_args)
 import torch
 from transformers import BitsAndBytesConfig
 
@@ -42,6 +43,7 @@ def main():
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--dtype", type=str, default="nf4", choices=["int8", "nf4", "fp4"])
     common_output_args(p)
+    common_eval_args(p)
     args = p.parse_args()
 
     bnb_config = build_bnb_config(args.dtype)
@@ -55,35 +57,18 @@ def main():
     with open(os.path.join(args.output_dir, "quantization_config.json"), "w") as f:
         f.write(bnb_config.to_json_string())
 
-    # --- 【修正】bitsandbytesの評価用（Perplexity用）データも、長い文脈に結合して渡す ---
-    print("🤖 bnb評価用データの結合処理を開始します...")
-    eval_raw_texts = default_calibration_texts(100)  # 多めにロード
-    eval_input_ids = []
-    for text in eval_raw_texts:
-        if text.strip():
-            eval_input_ids.extend(tokenizer.encode(text, add_special_tokens=False))
-            eval_input_ids.append(tokenizer.eos_token_id)
-            
-    # 2048トークンずつの評価用チャンクを綺麗に作成
-    eval_texts = []
-    seqlen = 2048
-    for i in range(0, len(eval_input_ids), seqlen):
-        chunk = eval_input_ids[i : i + seqlen]
-        if len(chunk) == seqlen:
-            eval_texts.append(tokenizer.decode(chunk))
-            if len(eval_texts) >= 10:  # 10サンプル（約2万トークン）
-                break
-                
-    # 結合された高品質なテキストで正しく Perplexity を測定
+    print("📊 性能ベンチマークを測定中（PPL: WikiText-2 test）...")
     latency = measure_llm_latency(model, tokenizer)
-    ppl = measure_perplexity(model, tokenizer, eval_texts)
-    # --------------------------------------------------------------------------------
-
+    ppl = measure_perplexity_wikitext(model, tokenizer, seqlen=args.seqlen,
+                                      max_chunks=args.eval_max_chunks)
 
     results = {
         "method": "bitsandbytes",
         "dtype": args.dtype,
+        "calib_data": None,  # キャリブレーション不要
+        "eval_data": f"wikitext2-test seqlen={args.seqlen} max_chunks={args.eval_max_chunks}",
         "num_params": get_num_params(model),
+        # bnb は重みを実際に 4bit/8bit で保持するため、メモリ上サイズがそのまま圧縮後サイズになる
         "model_size_mb": get_model_size_mb(model),
         "perplexity": ppl,
         **latency,
