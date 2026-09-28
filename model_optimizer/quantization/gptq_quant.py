@@ -33,6 +33,7 @@
     --output_dir ./output/mistral7b-gptqmodel-int4
 """
 import sys, os, argparse
+import torch
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "common"))
 from model_utils import (get_model_size_mb, get_num_params, measure_llm_latency,
                           measure_perplexity, default_calibration_texts,
@@ -46,12 +47,10 @@ def main():
     p.add_argument("--group_size", type=int, default=128)
     p.add_argument("--desc_act", action="store_true",
                    help="活性化順序でのソートを有効化(精度重視。既定はFalseで速度優先)")
-    p.add_argument("--num_calib_samples", type=int, default=128)
+    p.add_argument("--num_calib_samples", type=int, default=512,
+                   help="キャリブレーションに使用するサンプル総数（トークン結合後のサンプル数になります）")
     p.add_argument("--load_backend", type=str, default="torch",
-                   help="量子化済みモデル再ロード時の推論バックエンド(gptqmodel.BACKEND)。"
-                        "既定はtorch(純PyTorch, JITビルド不要でCUDA_HOME不要)。"
-                        "高速カーネルを使う場合はauto/marlin/exllama_v2等を指定"
-                        "(CUDA_HOMEの設定されたCUDA Toolkitが必要)。")
+                   help="量子化済みモデル再ロード時の推論バックエンド(gptqmodel.BACKEND)。")
     common_output_args(p)
     args = p.parse_args()
 
@@ -70,20 +69,69 @@ def main():
 
     model = GPTQModel.from_pretrained(args.model_path, quantize_config)
 
-    # キャリブレーションデータ（GPTQModelは生テキストのリスト+tokenizerを直接受け付ける）
-    calib_texts = default_calibration_texts(args.num_calib_samples)
-    model.quantize(calibration=calib_texts, tokenizer=tokenizer, batch_size=1)
+    # --- 【修正】十分な量の生テキストを取得し、2048トークンに結合して必要サンプル数を確保する ---
+    print("🤖 キャリブレーションデータの結合・生成を開始します...")
+    # 結合して2048トークンにするため、多め（サンプル数 × 60倍）の短いテキストをロード
+    raw_texts = default_calibration_texts(args.num_calib_samples * 60)
+    
+    # すべての短いテキストを一度トークナイズして1つの巨大なトークン配列に結合
+    all_input_ids = []
+    for text in raw_texts:
+        if text.strip():
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            all_input_ids.extend(ids)
+            all_input_ids.append(tokenizer.eos_token_id)  # 区切りとしてEOSを付与
+
+    # 2048トークンずつの綺麗なチャンクに切り出し、目標のサンプル数(args.num_calib_samples)を作成
+    seqlen = 2048
+    calib_dataset = []
+    for i in range(0, len(all_input_ids), seqlen):
+        chunk = all_input_ids[i : i + seqlen]
+        if len(chunk) == seqlen:  # 端数は切り捨て
+            calib_dataset.append({
+                "input_ids": torch.tensor([chunk]),
+                "attention_mask": torch.tensor([[1] * seqlen])
+            })
+            if len(calib_dataset) >= args.num_calib_samples:
+                break
+
+    print(f"✅ 平均コンテキスト長 {seqlen} のサンプルを {len(calib_dataset)} 個作成しました。")
+    
+    # 結合済みのデータセットを直接渡して量子化（tokenizer=NoneでOK）
+    model.quantize(calibration=calib_dataset, tokenizer=None, batch_size=1)
+    # --------------------------------------------------------------------------------
 
     os.makedirs(args.output_dir, exist_ok=True)
     model.save(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
     # 量子化済みモデルを再ロードして評価
-    # backend="torch"(既定)はMarlin/ExLlamaV2等のJITビルド済みCUDAカーネルを使わないため、
-    # CUDA_HOMEが未設定の環境でも失敗しない(速度より確実な動作を優先)。
     quant_model = GPTQModel.load(args.output_dir, backend=args.load_backend)
     latency = measure_llm_latency(quant_model, tokenizer)
-    ppl = measure_perplexity(quant_model, tokenizer, default_calibration_texts(32))
+    
+    # --- 【修正】評価（Perplexity測定）に使うテキストも、長い文脈に結合して渡す ---
+    print("🤖 評価用（Perplexity用）データの結合処理を開始します...")
+    eval_raw_texts = default_calibration_texts(100) # 多めに取得
+    eval_input_ids = []
+    for text in eval_raw_texts:
+        if text.strip():
+            eval_input_ids.extend(tokenizer.encode(text, add_special_tokens=False))
+            eval_input_ids.append(tokenizer.eos_token_id)
+            
+    # 2048トークンずつの評価用チャンクを数個作成し、それをデコードして生テキストのリストに戻す
+    eval_texts = []
+    seqlen = 2048
+    for i in range(0, len(eval_input_ids), seqlen):
+        chunk = eval_input_ids[i : i + seqlen]
+        if len(chunk) == seqlen:
+            eval_texts.append(tokenizer.decode(chunk))
+            if len(eval_texts) >= 10: # 評価用には10サンプル（2万トークン以上）あれば十分です
+                break
+                
+    # 結合された高品質なテキストを Perplexity 測定に渡す
+    ppl = measure_perplexity(quant_model, tokenizer, eval_texts)
+    # --------------------------------------------------------------------------------
+
 
     results = {
         "method": "gptq (gptqmodel)",

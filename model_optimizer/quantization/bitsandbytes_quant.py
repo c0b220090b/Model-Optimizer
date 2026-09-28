@@ -55,9 +55,30 @@ def main():
     with open(os.path.join(args.output_dir, "quantization_config.json"), "w") as f:
         f.write(bnb_config.to_json_string())
 
-    texts = default_calibration_texts(32)
+    # --- 【修正】bitsandbytesの評価用（Perplexity用）データも、長い文脈に結合して渡す ---
+    print("🤖 bnb評価用データの結合処理を開始します...")
+    eval_raw_texts = default_calibration_texts(100)  # 多めにロード
+    eval_input_ids = []
+    for text in eval_raw_texts:
+        if text.strip():
+            eval_input_ids.extend(tokenizer.encode(text, add_special_tokens=False))
+            eval_input_ids.append(tokenizer.eos_token_id)
+            
+    # 2048トークンずつの評価用チャンクを綺麗に作成
+    eval_texts = []
+    seqlen = 2048
+    for i in range(0, len(eval_input_ids), seqlen):
+        chunk = eval_input_ids[i : i + seqlen]
+        if len(chunk) == seqlen:
+            eval_texts.append(tokenizer.decode(chunk))
+            if len(eval_texts) >= 10:  # 10サンプル（約2万トークン）
+                break
+                
+    # 結合された高品質なテキストで正しく Perplexity を測定
     latency = measure_llm_latency(model, tokenizer)
-    ppl = measure_perplexity(model, tokenizer, texts)
+    ppl = measure_perplexity(model, tokenizer, eval_texts)
+    # --------------------------------------------------------------------------------
+
 
     results = {
         "method": "bitsandbytes",

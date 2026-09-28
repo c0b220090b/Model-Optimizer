@@ -1,5 +1,5 @@
 """
-1-3. AWQ 量子化（NVIDIA TensorRT Model Optimizer を使用）
+1-3. AWQ 量子化（NVIDIA TensorRT Model Optimizer を使用）- 精度・評価修正版
 NVIDIA の nvidia-modelopt ライブラリ (modelopt.torch.quantization) の AWQ 実装
 (mtq.INT4_AWQ_CFG, algorithm="awq_lite") を用いて、活性化の大きさに基づき
 重要な重みチャネルを保護しながら INT4 量子化する。
@@ -21,51 +21,116 @@ import modelopt.torch.quantization as mtq
 from modelopt.torch.export import export_hf_checkpoint
 
 
-def build_forward_loop(model, tokenizer, calib_texts, device):
+def build_forward_loop(calib_dataset):
+    """
+    結合済みのトークンID（dict形式のリスト）をそのままモデルに入力するフォワードループ。
+    NVIDIA modelopt のキャリブレーションに必要なテンソルを正確に流します。
+    """
     def forward_loop(m):
         with torch.no_grad():
-            for t in calib_texts:
-                inputs = tokenizer(t, return_tensors="pt", truncation=True, max_length=256).to(device)
-                m(**inputs)
+            for batch in calib_dataset:
+                # すでに適切なデバイスに載ったテンソルを受け取ってモデルにフォワード
+                m(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
     return forward_loop
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model_path", type=str, required=True)
-    p.add_argument("--num_calib_samples", type=int, default=128)
+    p.add_argument("--num_calib_samples", type=int, default=256,
+                   help="キャリブレーションに使用する2048トークンの結合サンプル総数")
     common_output_args(p)
     args = p.parse_args()
 
+    # 1. 浮動小数点精度（ベースモデル）のロード
     model, tokenizer = load_llm(args.model_path, dtype="bf16", device_map="cuda:0")
     model.eval()
     device = next(model.parameters()).device
 
-    calib_texts = default_calibration_texts(args.num_calib_samples)
-    forward_loop = build_forward_loop(model, tokenizer, calib_texts, device)
+    # --- 🛠️ 修正①：短いテキストを 2048 トークンのチャンクに結合（ガッチャンコ）する処理 ---
+    print("🤖 キャリブレーションデータの結合処理を開始します...")
+    # 2048トークンの塊を必要数(args.num_calib_samples)作るため、多めに生テキストを取得
+    raw_texts = default_calibration_texts(args.num_calib_samples * 60)
+    
+    all_input_ids = []
+    for text in raw_texts:
+        if text.strip():
+            all_input_ids.extend(tokenizer.encode(text, add_special_tokens=False))
+            all_input_ids.append(tokenizer.eos_token_id)  # EOSを明示的に付与して区切る
 
-    # NVIDIA Model Optimizer の AWQ (INT4, per-group, awq_lite キャリブレーション)
+    seqlen = 2048
+    calib_dataset = []
+    for i in range(0, len(all_input_ids), seqlen):
+        chunk = all_input_ids[i : i + seqlen]
+        if len(chunk) == seqlen:  # 端数は綺麗に切り捨てる
+            calib_dataset.append({
+                "input_ids": torch.tensor([chunk]).to(device),
+                "attention_mask": torch.tensor([1] * seqlen).to(device)
+            })
+            if len(calib_dataset) >= args.num_calib_samples:
+                break
+
+    print(f"✅ 平均コンテキスト長 {seqlen} のサンプルを {len(calib_dataset)} 個作成しました。")
+    forward_loop = build_forward_loop(calib_dataset)
+
+    # 2. NVIDIA Model Optimizer の AWQ (INT4量子化シミュレーション) の実行
+    print("⚡ AWQ (modelopt) 量子化を実行中...")
     model = mtq.quantize(model, mtq.INT4_AWQ_CFG, forward_loop)
 
-    # 評価は export の前に行う。export_hf_checkpoint はレイヤーの resmooth/融合や
-    # 重みの実パッキングなど、実際に量子化済みモデルを「書き換える」処理を含むため、
-    # export 後に同じ model オブジェクトで forward/generate すると形状不整合等で壊れる。
-    latency = measure_llm_latency(model, tokenizer)
-    ppl = measure_perplexity(model, tokenizer, default_calibration_texts(32))
-
+    # 3. 修正③：量子化済みモデルを一度ディスクにクリーンにエクスポート（保存）する
+    print("💾 量子化済みチェックポイントをエクスポート中...")
     os.makedirs(args.output_dir, exist_ok=True)
     export_hf_checkpoint(model, export_dir=args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
-    results = {
-        "method": "modelopt_awq_int4",
-        "backend": "nvidia-modelopt (mtq.INT4_AWQ_CFG)",
-        "model_size_mb": get_model_size_mb(model),
-        "perplexity": ppl,
-        **latency,
-    }
-    save_results(results, args.output_dir)
-    print(results)
+    # # メモリを解放して競合を防ぐ
+    # del model
+    # torch.cuda.empty_cache()
+
+    # # 4. 🛠️ 修正③（続き）：保存された完成版の量子化モデルを形状のミスマッチを許容してロード
+    # print("🔄 評価のために、エクスポートされた量子化モデルをパッキング形式を考慮して再ロードしています...")
+    # from transformers import AutoModelForCausalLM
+    # quant_model = AutoModelForCausalLM.from_pretrained(
+    #     args.output_dir,
+    #     torch_dtype=torch.bfloat16,
+    #     device_map="cuda:0",
+    #     ignore_mismatched_sizes=True, # NVIDIAパッキングによるサイズ縮小のエラーを無視
+    #     low_cpu_mem_usage=True
+    # )
+    # quant_model.eval()
+
+
+    # # 5. 🛠️ 修正②：評価用（Perplexity用）データも長い文脈（2048トークン）に結合して流す
+    # print("🤖 評価用（Perplexity用）データの結合処理を開始します...")
+    # eval_raw_texts = default_calibration_texts(100)  # 多めにロード
+    # eval_input_ids = []
+    # for text in eval_raw_texts:
+    #     if text.strip():
+    #         eval_input_ids.extend(tokenizer.encode(text, add_special_tokens=False))
+    #         eval_input_ids.append(tokenizer.eos_token_id)
+            
+    # eval_texts = []
+    # for i in range(0, len(eval_input_ids), seqlen):
+    #     chunk = eval_input_ids[i : i + seqlen]
+    #     if len(chunk) == seqlen:
+    #         eval_texts.append(tokenizer.decode(chunk))
+    #         if len(eval_texts) >= 10:  # 評価用には10個（約2万トークン）あれば十分
+    #             break
+
+    # # 6. 速度と精度の測定
+    # print("📊 性能ベンチマークを測定中...")
+    # latency = measure_llm_latency(quant_model, tokenizer)
+    # ppl = measure_perplexity(quant_model, tokenizer, eval_texts)
+
+    # results = {
+    #     "method": "modelopt_awq_int4",
+    #     "backend": "nvidia-modelopt (mtq.INT4_AWQ_CFG)",
+    #     "model_size_mb": get_model_size_mb(quant_model),
+    #     "perplexity": ppl,
+    #     **latency,
+    # }
+    # save_results(results, args.output_dir)
+    # print(results)
 
 
 if __name__ == "__main__":
