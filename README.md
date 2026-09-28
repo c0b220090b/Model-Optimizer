@@ -1,202 +1,224 @@
-<div align="center">
+# Model-Optimizer
 
-![Banner image](docs/source/assets/model-optimizer-banner.png)
+LLM（大規模言語モデル）および拡散モデル（Diffusion Model）に対して、量子化・枝刈り（プルーニング）・蒸留などの最適化手法を適用し、精度と速度・メモリのトレードオフを検証するためのツールキットです。
 
-# NVIDIA Model Optimizer
+各最適化手法は `` 配下に**実行可能なスクリプトとして実装済み**です（雛形ではありません）。
 
-[![Documentation](https://img.shields.io/badge/Documentation-latest-brightgreen.svg?style=flat)](https://nvidia.github.io/Model-Optimizer)
-[![version](https://img.shields.io/pypi/v/nvidia-modelopt?label=Release)](https://pypi.org/project/nvidia-modelopt/)
-[![license](https://img.shields.io/badge/License-Apache%202.0-blue)](./LICENSE)
+## NVIDIA TensorRT Model Optimizer (nvidia-modelopt) の利用について
 
-[Documentation](https://nvidia.github.io/Model-Optimizer) |
-[Roadmap](https://github.com/NVIDIA/Model-Optimizer/issues/1699) |
-[Announcement Blogs](https://nvidia.github.io/Model-Optimizer/#announcements)
+本プロジェクトは、NVIDIA が公開している量子化・枝刈り・蒸留・投機的デコーディングの統合ライブラリ
+[**NVIDIA TensorRT Model Optimizer**](https://github.com/NVIDIA/TensorRT-Model-Optimizer)（PyPIパッケージ名: `nvidia-modelopt`, import名: `modelopt`）を、**該当する手法では実装の主軸として採用**しています。
 
-</div>
+modelopt が公式にサポートする範囲は以下の通りで、**この範囲内の手法は modelopt の API (`modelopt.torch.quantization`, `.sparsity`, `.distill`, `.speculative`) を直接呼び出す実装**に更新しました。
 
-______________________________________________________________________
+| modelopt モジュール | 本プロジェクトで使用している箇所 |
+| --- | --- |
+| `modelopt.torch.quantization` (`mtq`) | AWQ, SmoothQuant, FP8, KVキャッシュ量子化, 拡散モデル(U-Net/TextEncoder/VAE)のPTQ, 複合適用 |
+| `modelopt.torch.sparsity` (`mts`) | Magnitude Pruning, SparseGPT, 2:4構造化スパース（modeloptの重みスパース化は**2:4パターン固定**） |
+| `modelopt.torch.distill` (`mtd`) | 知識蒸留（Teacher-Student, `kd_loss`モード） |
+| `modelopt.torch.speculative` (`mtsp`) | Speculative Decoding（Medusaヘッドの追加・学習） |
 
-**NVIDIA Model Optimizer** (referred to as **Model Optimizer**, or **ModelOpt**) is a library comprising state-of-the-art model optimization [techniques](#techniques) including quantization, pruning, Neural Architecture Search (NAS), distillation, speculative decoding and sparsity to accelerate models.
+一方で、以下の手法は **modelopt の対象外**であるため、従来通り各手法固有のライブラリ・自前実装を使用しています（理由も明記）。
 
-**[Input]** Model Optimizer currently supports inputs of a [Hugging Face](https://huggingface.co/), [PyTorch](https://github.com/pytorch/pytorch) or [ONNX](https://github.com/onnx/onnx) model.
+| 手法 | 実装 | modelopt を使わない理由 |
+| --- | --- | --- |
+| bitsandbytes INT8/NF4 | bitsandbytes | bitsandbytes 独自の量子化フォーマットであり、modeloptとは別プロジェクト |
+| GPTQ | auto-gptq | GPTQアルゴリズム自体はmodeloptに実装されていない（modeloptはAWQ/SmoothQuant/maxキャリブレーションを提供） |
+| GGUF量子化 | llama.cpp | llama.cpp独自フォーマットであり、CPU/エッジ推論用の別エコシステム |
+| LoRAベース QAT | peft + bitsandbytes | QLoRA方式のQATはPEFTの領域。modeloptにもQAT機能はあるがLoRA統合はPEFT側が主流 |
+| LLM-Pruner / Depth Pruning / Attention Head Pruning | 自前実装（Taylor近似, コサイン類似度等） | modeloptの構造化枝刈り(`mcore_minitron`)はNVIDIA Megatron-Core形式のモデルが対象で、一般のHuggingFaceモデルには非対応 |
+| SVD低ランク分解 | 自前実装 | modeloptのスコープ外（NAS/量子化/スパース化/蒸留/投機的デコーディングが対象） |
+| FlashAttention導入, torch.compile | transformers / PyTorch標準機能 | modeloptの対象外（推論エンジン最適化はmodelopt上位のTensorRT-LLM等が担当） |
+| 拡散モデルの構造化チャンネルプルーニング | torch-pruning | modeloptのFastNAS構造化枝刈りは画像分類/セグメンテーション向けCNNバックボーンが主対象で、U-Netの条件付き生成アーキテクチャは公式検証範囲外 |
+| Attention Block枝刈り, Progressive Distillation, LCM, LCM-LoRA, ADD, サンプラー比較, Token Merging | diffusers / tomesd 等 | 拡散モデル特有の学習不要高速化・蒸留手法で、いずれもmodeloptではなくdiffusersエコシステム側の技術 |
 
-**[Optimize]** Model Optimizer provides Python APIs for users to easily compose the above model optimization techniques and export an optimized quantized checkpoint.
-Model Optimizer is also integrated with [NVIDIA Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge), [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) and [Hugging Face Accelerate](https://github.com/huggingface/accelerate) for training required inference optimization techniques.
+**重要**: `mtq.quantize()` によるPTQは基本的に「疑似量子化(fake-quant)」でキャリブレーション・精度検証を行うものであり、PyTorch上でそのまま実行しても実際の推論速度は変わりません。実際の高速化を得るには、`modelopt.torch.export` を使って ONNX / TensorRT / TensorRT-LLM 形式にエクスポートする必要があります（本プロジェクトのスクリプトはこの手前の「量子化・精度検証」までをカバーしています）。
 
-**[Export for deployment]** Seamlessly integrated within the NVIDIA AI software ecosystem, the quantized checkpoint generated from Model Optimizer is ready for deployment in downstream inference frameworks like [SGLang](https://github.com/sgl-project/sglang), [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization), [TensorRT](https://github.com/NVIDIA/TensorRT), or [vLLM](https://github.com/vllm-project/vllm). The unified Hugging Face export API now supports both transformers and diffusers models.
+全32スクリプト中の内訳: **nvidia-modelopt を直接使用 13本**（量子化4, 枝刈り3, その他LLM3, 拡散モデルPTQ3）／ **各手法固有ライブラリ・自前実装 19本**（下記の各表で実装欄に理由を記載）。
 
-## Latest News
+## 対象モデル
 
-- [2026/09/16] [**End-to-end W4A4 NVFP4 + QAD tutorial for Qwen3.6-35B-A3B**](./examples/megatron_bridge/tutorials/Qwen3.6-35B-A3B): NVFP4 W4A4 PTQ plus quantization-aware distillation, reaching up to 1.30x vLLM throughput over BF16 and 3.1x smaller checkpoints while recovering the accuracy W4A4 costs.
-- [2026/09/09] [BLOG: Improving NVFP4 Accuracy with Local-Hessian Weight Scales](https://nvidia.github.io/Model-Optimizer/announcements/local-hessian.html)
-- [2026/08/24] [BLOG: AutoQuantize: A Fast Automatic Mixed-Precision Assignment](https://nvidia.github.io/Model-Optimizer/announcements/autoquantize.html)
-- [2026/08/17] [BLOG: Developing Nemotron 3.5 Lightning NVFP4 with QAD Using NVIDIA Model Optimizer](https://developer.nvidia.com/blog/developing-nemotron-3-5-lightning-nvfp4-with-qad-using-nvidia-model-optimizer/): Learn how quantization-aware distillation recovers accuracy from aggressive NVFP4 quantization while reducing model size and increasing throughput.
-- [2026/06/26] [BLOG: Creating the NVIDIA Nemotron 3 Ultra NVFP4 Checkpoint with NVIDIA Model Optimizer](https://developer.nvidia.com/blog/creating-the-nvidia-nemotron-3-ultra-nvfp4-checkpoint-with-nvidia-model-optimizer/): How we quantized Nemotron 3 Ultra (550B) to NVFP4 with Model Optimizer — up to 5.9× higher decode-heavy inference throughput than GLM-5.1 754B FP4 while matching BF16 accuracy. [NVFP4 Checkpoint](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4) on Hugging Face.
-- [2026/05/27] [**End-to-end Optimization tutorial for Nemotron-3-Nano-30B-A3B**](./examples/megatron_bridge/tutorials/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16): Pruning + two-phase distillation + FP8 quantization achieving 2.6× vLLM throughput and 2.6× memory reduction.
-- [2026/05/13] [**Puzzletron**](./examples/puzzletron): A new algorithm for heterogeneous pruning & NAS of LLM and VLM models.
-- [2026/04/15] Customer story: [Domyn compresses Colosseum-355B → 260B using ModelOpt's Minitron pruning + distillation](https://www.domyn.com/blog/domyn-large-the-journey-of-a-european-sovereign-ai-model-for-regulated-industries)
-- [2026/03/17] Customer story: [Bielik.AI builds Bielik Minitron 7B (33% smaller, 50% faster, 90% quality retained) using ModelOpt's Minitron pruning + distillation](https://bielik.ai/en/nvidia-gtc-bielik-minitron-premiere/)
-- [2026/03/11] Model Optimizer quantized Nemotron-3-Super checkpoints are available on Hugging Face for download: [FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8), [NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4). Learn more in the [Nemotron 3 Super release blog](https://blogs.nvidia.com/blog/nemotron-3-super-agentic-ai/). Check out how to quantize Nemotron 3 models for deployment acceleration [here](./examples/hf_ptq/README.md)
-- [2026/03/11] [NeMo Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) now supports Nemotron-3-Super quantization (PTQ and QAT) and export workflows using the Model Optimizer library. See the [Quantization (PTQ and QAT) guide](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/super-v3/docs/models/llm/nemotron3-super.md#quantization-ptq-and-qat) for FP8/NVFP4 quantization and HF export instructions.
-- [2025/12/11] [BLOG: Top 5 AI Model Optimization Techniques for Faster, Smarter Inference](https://developer.nvidia.com/blog/top-5-ai-model-optimization-techniques-for-faster-smarter-inference/)
-- [2025/12/08] NVIDIA TensorRT Model Optimizer is now officially rebranded as NVIDIA Model Optimizer.
-- [2025/10/07] [BLOG: Pruning and Distilling LLMs Using NVIDIA Model Optimizer](https://developer.nvidia.com/blog/pruning-and-distilling-llms-using-nvidia-tensorrt-model-optimizer/)
-- [2025/09/17] [BLOG: An Introduction to Speculative Decoding for Reducing Latency in AI Inference](https://developer.nvidia.com/blog/an-introduction-to-speculative-decoding-for-reducing-latency-in-ai-inference/)
-- [2025/09/11] [BLOG: How Quantization Aware Training Enables Low-Precision Accuracy Recovery](https://developer.nvidia.com/blog/how-quantization-aware-training-enables-low-precision-accuracy-recovery/)
-- [2025/08/29] [BLOG: Fine-Tuning gpt-oss for Accuracy and Performance with Quantization Aware Training](https://developer.nvidia.com/blog/fine-tuning-gpt-oss-for-accuracy-and-performance-with-quantization-aware-training/)
-- [2025/08/01] [BLOG: Optimizing LLMs for Performance and Accuracy with Post-Training Quantization](https://developer.nvidia.com/blog/optimizing-llms-for-performance-and-accuracy-with-post-training-quantization/)
-- [2025/06/24] [BLOG: Introducing NVFP4 for Efficient and Accurate Low-Precision Inference](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
-- [2025/05/14] [NVIDIA TensorRT Unlocks FP4 Image Generation for NVIDIA Blackwell GeForce RTX 50 Series GPUs](https://developer.nvidia.com/blog/nvidia-tensorrt-unlocks-fp4-image-generation-for-nvidia-blackwell-geforce-rtx-50-series-gpus/)
-- [2025/04/21] [Adobe optimized deployment using Model-Optimizer + TensorRT leading to a 60% reduction in diffusion latency, a 40% reduction in total cost of ownership](https://developer.nvidia.com/blog/optimizing-transformer-based-diffusion-models-for-video-generation-with-nvidia-tensorrt/)
-- [2025/04/05] [NVIDIA Accelerates Inference on Meta Llama 4 Scout and Maverick](https://developer.nvidia.com/blog/nvidia-accelerates-inference-on-meta-llama-4-scout-and-maverick/). Check out how to quantize Llama4 for deployment acceleration [here](./examples/hf_ptq/README.md#support-matrix)
-- [2025/03/18] [World's Fastest DeepSeek-R1 Inference with Blackwell FP4 & Increasing Image Generation Efficiency on Blackwell](https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/)
-- [2025/02/25] Model Optimizer quantized NVFP4 models available on Hugging Face for download: [DeepSeek-R1-FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), [Llama-3.3-70B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.3-70B-Instruct-FP4), [Llama-3.1-405B-Instruct-FP4](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP4)
-- [2025/01/28] Model Optimizer has added support for NVFP4. Check out an example of NVFP4 PTQ [here](./examples/hf_ptq/README.md#getting-started).
-- [2025/01/28] Model Optimizer is now open source!
+検証を素早く回せるよう、軽量モデル〜標準的なモデルまでを段階的に対象とします。
 
-<details close>
-<summary>Previous News</summary>
+### LLM
 
-- [2024/10/23] Model Optimizer quantized FP8 Llama-3.1 Instruct models available on Hugging Face for download: [8B](https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8), [70B](https://huggingface.co/nvidia/Llama-3.1-70B-Instruct-FP8), [405B](https://huggingface.co/nvidia/Llama-3.1-405B-Instruct-FP8).
-- [2024/09/10] [Post-Training Quantization of LLMs with NVIDIA NeMo and Model Optimizer](https://developer.nvidia.com/blog/post-training-quantization-of-llms-with-nvidia-nemo-and-nvidia-tensorrt-model-optimizer/).
-- [2024/08/28] [Boosting Llama 3.1 405B Performance up to 44% with Model Optimizer on NVIDIA H200 GPUs](https://developer.nvidia.com/blog/boosting-llama-3-1-405b-performance-by-up-to-44-with-nvidia-tensorrt-model-optimizer-on-nvidia-h200-gpus/)
-- [2024/08/28] [Up to 1.9X Higher Llama 3.1 Performance with Medusa](https://developer.nvidia.com/blog/low-latency-inference-chapter-1-up-to-1-9x-higher-llama-3-1-performance-with-medusa-on-nvidia-hgx-h200-with-nvlink-switch/)
-- [2024/08/15] New features in recent releases: [Cache Diffusion](./examples/diffusers/cache_diffusion), [QLoRA workflow with NVIDIA NeMo](https://docs.nvidia.com/nemo-framework/user-guide/24.09/sft_peft/qlora.html), and more. Check out [our blog](https://developer.nvidia.com/blog/nvidia-tensorrt-model-optimizer-v0-15-boosts-inference-performance-and-expands-model-support/) for details.
-- [2024/06/03] Model Optimizer now has an experimental feature to deploy to vLLM as part of our effort to support popular deployment frameworks. Check out the workflow [here](./examples/hf_ptq/README.md#vllm)
-- [2024/05/08] [Announcement: Model Optimizer Now Formally Available to Further Accelerate GenAI Inference Performance](https://developer.nvidia.com/blog/accelerate-generative-ai-inference-performance-with-nvidia-tensorrt-model-optimizer-now-publicly-available/)
-- [2024/03/27] [Model Optimizer supercharges TensorRT-LLM to set MLPerf LLM inference records](https://developer.nvidia.com/blog/nvidia-h200-tensor-core-gpus-and-nvidia-tensorrt-llm-set-mlperf-llm-inference-records/)
-- [2024/03/18] [GTC Session: Optimize Generative AI Inference with Quantization in TensorRT-LLM and TensorRT](https://www.nvidia.com/en-us/on-demand/session/gtc24-s63213/)
-- [2024/03/07] [Model Optimizer's 8-bit Post-Training Quantization enables TensorRT to accelerate Stable Diffusion to nearly 2x faster](https://developer.nvidia.com/blog/tensorrt-accelerates-stable-diffusion-nearly-2x-faster-with-8-bit-post-training-quantization/)
-- [2024/02/01] [Speed up inference with Model Optimizer quantization techniques in TRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/quantization-in-TRT-LLM.md)
+| モデル | パラメータ数 | 用途・選定理由 |
+| --- | --- | --- |
+| TinyLlama-1.1B-Chat | 1.1B | 最適化手法のデバッグ・高速イテレーション用ベースライン |
+| Phi-3.5-mini-instruct | 3.8B | エッジ／省メモリ環境向け最適化の検証 |
+| Mistral-7B-Instruct-v0.3 | 7B | 標準的な Dense Transformer の代表 |
+| Llama-3.1-8B-Instruct | 8B | 最も情報・先行事例が多い基準モデル |
+| Qwen2.5-7B-Instruct | 7B | 日本語を含む多言語性能の検証、Llama系との比較用 |
 
-</details>
+### 拡散モデル（Text-to-Image）
 
-## Install
+| モデル | アーキテクチャ | 用途・選定理由 |
+| --- | --- | --- |
+| Stable Diffusion 1.5 | U-Net（Latent Diffusion） | 軽量・情報豊富な定番ベースライン |
+| Stable Diffusion XL (SDXL) 1.0 | U-Net（大型） | 高解像度・高品質モデルでの最適化効果を検証 |
+| SD-Turbo / SDXL-Turbo | 蒸留済み U-Net | 「既に蒸留済みのモデル」への追加最適化の余地を検証 |
+| Stable Diffusion 3 Medium | DiT（Diffusion Transformer） | Transformer ベースの拡散モデルでの最適化検証 |
+| ControlNet（SD1.5 base） | U-Net + 条件付け分岐 | 条件付き生成モデルでの最適化への影響を確認 |
 
-To install stable release packages for Model Optimizer with `pip` from [PyPI](https://pypi.org/project/nvidia-modelopt/):
+## ディレクトリ構成
 
-```bash
-pip install -U nvidia-modelopt[all]
+```
+Model-Optimizer/
+├── README.md
+├── requirements.txt
+├── output/                                 # 最適化後モデルの出力先
+├── results/                                # ベンチマーク結果(json)の集約先
+└── model_optimizer/                        # Pythonパッケージ本体 (__init__.py あり)
+    ├── __init__.py
+    ├── common/
+    │   └── model_utils.py                # ロード/計測/評価の共通関数
+    ├── quantization/                      # 1. LLM量子化
+    │   ├── bitsandbytes_quant.py
+    │   ├── gptq_quant.py
+    │   ├── awq_quant.py
+    │   ├── smoothquant_quant.py
+    │   ├── gguf_quant.sh
+    │   ├── fp8_quant.py
+    │   ├── kv_cache_quant.py
+    │   └── qat_lora.py
+    ├── pruning/                            # 2. LLM枝刈り
+    │   ├── magnitude_pruning.py
+    │   ├── wanda_pruning.py
+    │   ├── sparsegpt_pruning.py
+    │   ├── llm_pruner.py
+    │   ├── depth_pruning.py
+    │   ├── attention_head_pruning.py
+    │   └── structured_sparsity_2_4.py
+    ├── llm_optim/                           # 3. LLMその他の最適化
+    │   ├── knowledge_distillation.py
+    │   ├── low_rank_decomposition.py
+    │   ├── speculative_decoding.py
+    │   ├── flash_attention.py
+    │   ├── torch_compile_opt.py
+    │   └── combined_quant_prune.py
+    ├── diffusion_quant_prune/                 # 4. 拡散モデル量子化・枝刈り
+    │   ├── unet_ptq_int8.py
+    │   ├── text_encoder_quant.py
+    │   ├── vae_quant.py
+    │   ├── unet_channel_pruning.py
+    │   └── attention_block_pruning.py
+    └── diffusion_distill/                       # 5. 拡散モデル蒸留・高速サンプリング
+        ├── progressive_distillation.py
+        ├── lcm_distillation.py
+        ├── lcm_lora.py
+        ├── add_distillation.py
+        ├── sampler_comparison.py
+        └── token_merging.py
 ```
 
-Model Optimizer will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
+すべてのスクリプトは `--output_dir` を必須引数にとり、最適化後モデル・生成画像・`result.json`（精度/速度/メモリの計測結果）をそこに保存します。
 
-To install from source in editable mode with all development dependencies or to use the latest features, run:
+## 動作環境
+
+- Python 3.10+
+- PyTorch 2.x
+- CUDA 11.8+（GPU 使用時、FP8検証には Ada/Hopper世代推奨、2:4スパースはAmpere以降推奨）
+- diffusers, transformers, accelerate, peft
+- nvidia-modelopt[hf]（AWQ/SmoothQuant/FP8/KVキャッシュ量子化/2:4スパース/蒸留/Speculative Decoding/拡散モデルPTQ で使用）
+- （手法により）bitsandbytes, auto-gptq, torch-pruning, tomesd, llama.cpp
+
+## インストール
 
 ```bash
-# Clone the Model Optimizer repository
-git clone git@github.com:NVIDIA/Model-Optimizer.git
 cd Model-Optimizer
-
-pip install -e .[dev]
+pip install -r requirements.txt
 ```
 
-You can also directly use NVIDIA container images, which have Model Optimizer pre-installed:
+各パッケージディレクトリ（`common/`, `quantization/`, `pruning/`, `llm_optim/`, `diffusion_quant_prune/`, `diffusion_distill/`）には `__init__.py` があり、`model_optimizer` は通常のPythonパッケージとして構成されています。スクリプトは `model_optimizer/` 内から直接実行できます（例: `cd model_optimizer && python quantization/awq_quant.py ...`）。
 
-- `nvcr.io/nvidia/pytorch:<version>-py3`
-- `nvcr.io/nvidia/nemo:<version>`
-- `nvcr.io/nvidia/tensorrt-llm/release:<version>`
+GGUF変換（`gguf_quant.sh`）のみ、別途 llama.cpp のクローン・ビルドが必要です（スクリプト内コメント参照）。
 
-Before pulling and using the container images, please review their respective license terms.
-Make sure to upgrade Model Optimizer to the latest version as described above.
-Visit our [installation guide](https://nvidia.github.io/Model-Optimizer/getting_started/2_installation.html) for
-more fine-grained control on installed dependencies or for alternative docker images and environment variables to setup.
+## 使い方: 手法一覧と実行コマンド
 
-## Techniques
+### 1. LLM — 量子化 (`quantization/`)
 
-<div align="center">
+| 手法 | 種別 | 実装 | スクリプト | 実行例 |
+| --- | --- | --- | --- | --- |
+| bitsandbytes INT8/NF4 | PTQ（重みのみ） | bitsandbytes | `bitsandbytes_quant.py` | `python quantization/bitsandbytes_quant.py --model_path meta-llama/Llama-3.1-8B-Instruct --dtype nf4 --output_dir ./output/llama3.1-8b-bnb-nf4` |
+| GPTQ | PTQ（キャリブレーション要） | auto-gptq | `gptq_quant.py` | `python quantization/gptq_quant.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --bits 4 --group_size 128 --output_dir ./output/mistral7b-gptq-int4` |
+| AWQ | PTQ（重要チャネル保護） | **nvidia-modelopt** (`mtq.INT4_AWQ_CFG`) | `awq_quant.py` | `python quantization/awq_quant.py --model_path meta-llama/Llama-3.1-8B-Instruct --output_dir ./output/llama3.1-8b-modelopt-awq-int4` |
+| SmoothQuant | PTQ（重み＋活性化） | **nvidia-modelopt** (`mtq.INT8_SMOOTHQUANT_CFG`) | `smoothquant_quant.py` | `python quantization/smoothquant_quant.py --model_path facebook/opt-1.3b --output_dir ./output/opt1.3b-modelopt-smoothquant-int8` |
+| GGUF (Q4_K_M等) | PTQ | llama.cpp | `gguf_quant.sh` | `./quantization/gguf_quant.sh ./models/llama3.1-8b ./llama.cpp ./output/llama3.1-8b-gguf Q4_K_M` |
+| FP8 (H100/Ada) | PTQ | **nvidia-modelopt** (`mtq.FP8_DEFAULT_CFG`) | `fp8_quant.py` | `python quantization/fp8_quant.py --model_path meta-llama/Llama-3.1-8B-Instruct --output_dir ./output/llama3.1-8b-modelopt-fp8` |
+| KVキャッシュ量子化 | PTQ | **nvidia-modelopt** (`mtq.FP8_KV_CFG`/`NVFP4_KV_CFG`) | `kv_cache_quant.py` | `python quantization/kv_cache_quant.py --model_path meta-llama/Llama-3.1-8B-Instruct --kv_dtype fp8 --context_len 4096 --output_dir ./output/llama3.1-8b-modelopt-kvfp8` |
+| LoRAベース QAT (QLoRA) | QAT | peft + bitsandbytes | `qat_lora.py` | `python quantization/qat_lora.py --model_path meta-llama/Llama-3.1-8B-Instruct --num_train_steps 200 --output_dir ./output/llama3.1-8b-qlora` |
 
-| **Technique** | **Description** | **Examples** | **Docs** |
-| :------------: | :------------: | :------------: | :------------: |
-| Post Training Quantization | Compress model size by 2x-4x, speeding up inference while preserving model quality! | \[[HF LLMs / VLMs](./examples/hf_ptq/)\] \[[Megatron-Bridge LLMs / VLMs](./examples/megatron_bridge/)\] \[[Diffusers](./examples/diffusers/)\] \[[ONNX](./examples/onnx_ptq/)\] \[[Windows](./examples/windows/)\] | \[[docs](https://nvidia.github.io/Model-Optimizer/guides/1_quantization.html)\] |
-| Quantization Aware Training / Distillation | Refine accuracy of quantized models even further with a few training steps! | \[[Hugging Face](./examples/llm_qat/)\] \[[Megatron-Bridge](./examples/megatron_bridge)\] | \[[docs](https://nvidia.github.io/Model-Optimizer/guides/1_quantization.html)\] |
-| Pruning | Reduce your model parameters or memory footprint and accelerate inference by removing unnecessary weights! | \[[General](./examples/pruning/)\] \[[Megatron-Bridge](./examples/megatron_bridge/)\] | |
-| Distillation | Reduce deployment model size by teaching small models to behave like larger models! | \[[Hugging Face](./examples/llm_distill/)\] \[[Megatron-Bridge](./examples/megatron_bridge/)\] \[[Megatron-LM](./examples/llm_distill/README.md#knowledge-distillation-kd-in-nvidia-megatron-lm-framework)\] | \[[docs](https://nvidia.github.io/Model-Optimizer/guides/4_distillation.html)\] |
-| Speculative Decoding | Train draft modules to predict extra tokens during inference! | \[[Hugging Face](./examples/speculative_decoding/)\] \[[Megatron-LM](./examples/speculative_decoding#mlm-example)\] | \[[docs](https://nvidia.github.io/Model-Optimizer/guides/5_speculative_decoding.html)\] |
-| Sparsity | Efficiently compress your model by storing only its non-zero parameter values and their locations | \[[Hugging Face](./examples/llm_sparsity/)\] | \[[docs](https://nvidia.github.io/Model-Optimizer/guides/6_sparsity.html)\] |
+### 2. LLM — 枝刈り (`pruning/`)
 
-</div>
+| 手法 | 種別 | 実装 | スクリプト | 実行例 |
+| --- | --- | --- | --- | --- |
+| Magnitude Pruning | 2:4構造化（既定）/ 任意率（`--backend custom`） | **nvidia-modelopt** (`mts.sparsify`, mode="sparse_magnitude") | `magnitude_pruning.py` | `python pruning/magnitude_pruning.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --output_dir ./output/mistral7b-modelopt-magnitude-2to4` |
+| Wanda | 非構造化（活性化考慮） | 自前実装（modelopt未対応の手法） | `wanda_pruning.py` | `python pruning/wanda_pruning.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --sparsity 0.5 --num_calib_samples 128 --output_dir ./output/mistral7b-wanda-50` |
+| SparseGPT | 2:4構造化（既定）/ 任意率（`--backend custom`） | **nvidia-modelopt** (`mts.sparsify`, mode="sparsegpt") | `sparsegpt_pruning.py` | `python pruning/sparsegpt_pruning.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --output_dir ./output/mistral7b-modelopt-sparsegpt-2to4` |
+| LLM-Pruner | 構造化（Taylor重要度） | 自前実装（modeloptの`mcore_minitron`はMegatron-Core専用のため） | `llm_pruner.py` | `python pruning/llm_pruner.py --model_path meta-llama/Llama-3.1-8B-Instruct --pruning_ratio 0.2 --output_dir ./output/llama3.1-8b-llmpruner-20` |
+| Depth Pruning（層除去） | 構造化 | 自前実装（同上） | `depth_pruning.py` | `python pruning/depth_pruning.py --model_path meta-llama/Llama-3.1-8B-Instruct --num_layers_to_remove 4 --output_dir ./output/llama3.1-8b-depthprune-4layers` |
+| Attention Head Pruning | 構造化 | 自前実装（同上） | `attention_head_pruning.py` | `python pruning/attention_head_pruning.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --head_pruning_ratio 0.25 --output_dir ./output/mistral7b-headprune-25` |
+| 2:4 構造化スパース性 | 構造化（HW対応） | **nvidia-modelopt**（Magnitude/SparseGPT 2スコアラー比較） | `structured_sparsity_2_4.py` | `python pruning/structured_sparsity_2_4.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --output_dir ./output/mistral7b-modelopt-2to4-comparison` |
 
-## Pre-Quantized Checkpoints
+### 3. LLM — その他の最適化 (`llm_optim/`)
 
-- Ready-to-deploy checkpoints \[[🤗 Hugging Face - Nvidia Model Optimizer Collection](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer)\]
-- Deployable on [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM), [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang)
-- More models coming soon!
+| 手法 | 実装 | スクリプト | 実行例 |
+| --- | --- | --- | --- |
+| 知識蒸留（Teacher-Student） | **nvidia-modelopt** (`mtd.convert`, mode="kd_loss") | `knowledge_distillation.py` | `python llm_optim/knowledge_distillation.py --teacher_model meta-llama/Llama-3.1-8B-Instruct --student_model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --num_train_steps 500 --output_dir ./output/tinyllama-modelopt-distilled` |
+| 低ランク分解 (SVD) | 自前実装（modeloptのスコープ外） | `low_rank_decomposition.py` | `python llm_optim/low_rank_decomposition.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --rank_ratio 0.5 --output_dir ./output/mistral7b-svd-r50` |
+| Speculative Decoding | **nvidia-modelopt** (`mtsp.convert`, mode="medusa") | `speculative_decoding.py` | `python llm_optim/speculative_decoding.py --model_path meta-llama/Llama-3.1-8B-Instruct --num_medusa_heads 4 --num_train_steps 300 --output_dir ./output/llama3.1-8b-modelopt-medusa` |
+| FlashAttention 導入 | transformers標準機能 | `flash_attention.py` | `python llm_optim/flash_attention.py --model_path meta-llama/Llama-3.1-8B-Instruct --output_dir ./output/llama3.1-8b-flashattn-compare` |
+| torch.compile / CUDA Graph | PyTorch標準機能 | `torch_compile_opt.py` | `python llm_optim/torch_compile_opt.py --model_path meta-llama/Llama-3.1-8B-Instruct --compile_mode reduce-overhead --output_dir ./output/llama3.1-8b-compile-compare` |
+| 量子化×枝刈りの複合適用 | **nvidia-modelopt**（`mts.sparsify` → `mtq.quantize`） | `combined_quant_prune.py` | `python llm_optim/combined_quant_prune.py --model_path mistralai/Mistral-7B-Instruct-v0.3 --sparsify_mode sparse_magnitude --quant_cfg FP8_DEFAULT_CFG --output_dir ./output/mistral7b-modelopt-2to4-fp8` |
 
-## Resources
+### 4. 拡散モデル — 量子化・枝刈り (`diffusion_quant_prune/`)
 
-- 📅 [Roadmap](https://github.com/NVIDIA/Model-Optimizer/issues/1699)
-- 📖 [Documentation](https://nvidia.github.io/Model-Optimizer)
-- 🎯 [Benchmarks](./examples/benchmark.md)
-- 💡 [Release Notes](https://nvidia.github.io/Model-Optimizer/reference/0_changelog.html)
-- 🐛 [File a bug](https://github.com/NVIDIA/Model-Optimizer/issues/new?template=1_bug_report.md)
-- ✨ [File a Feature Request](https://github.com/NVIDIA/Model-Optimizer/issues/new?template=2_feature_request.md)
+| 手法 | 実装 | スクリプト | 実行例 |
+| --- | --- | --- | --- |
+| U-Net の PTQ（INT8/FP8） | **nvidia-modelopt** (`mtq.quantize`) | `unet_ptq_int8.py` | `python diffusion_quant_prune/unet_ptq_int8.py --model_path runwayml/stable-diffusion-v1-5 --output_dir ./output/sd1.5-modelopt-unet-int8` |
+| Text Encoder の量子化 | **nvidia-modelopt** (`mtq.quantize`) | `text_encoder_quant.py` | `python diffusion_quant_prune/text_encoder_quant.py --model_path stabilityai/stable-diffusion-xl-base-1.0 --output_dir ./output/sdxl-modelopt-textencoder-int8` |
+| VAE の量子化 | **nvidia-modelopt** (`mtq.quantize`) | `vae_quant.py` | `python diffusion_quant_prune/vae_quant.py --model_path runwayml/stable-diffusion-v1-5 --output_dir ./output/sd1.5-modelopt-vae-int8` |
+| U-Net チャンネルプルーニング | torch-pruning（modeloptのFastNASはCV分類モデル向けのため） | `unet_channel_pruning.py` | `python diffusion_quant_prune/unet_channel_pruning.py --model_path runwayml/stable-diffusion-v1-5 --pruning_ratio 0.2 --output_dir ./output/sd1.5-unet-channelprune-20` |
+| Attention Block の枝刈り | 自前実装（Wanda方式, modelopt未対応） | `attention_block_pruning.py` | `python diffusion_quant_prune/attention_block_pruning.py --model_path runwayml/stable-diffusion-v1-5 --sparsity 0.4 --output_dir ./output/sd1.5-attn-pruned-40` |
 
-## Model Support Matrix
+### 5. 拡散モデル — ステップ数削減・蒸留系 (`diffusion_distill/`)
 
-| Model Type | Support Matrix |
-|------------|----------------|
-| LLM / VLM Quantization | [View Support Matrix](./examples/hf_ptq/README.md#support-matrix) |
-| Diffusers Quantization | [View Support Matrix](./examples/diffusers/README.md#support-matrix) |
-| ONNX Quantization | [View Support Matrix](./examples/torch_onnx/README.md#onnx-export-supported-llm-models) |
-| Windows Quantization | [View Support Matrix](./examples/windows/README.md#support-matrix) |
-| Quantization Aware Training | [View Support Matrix](./examples/llm_qat/README.md#support-matrix) |
-| Pruning | [View Support Matrix](./examples/pruning/README.md#support-matrix) |
-| Distillation | [View Support Matrix](./examples/llm_distill/README.md#support-matrix) |
-| Speculative Decoding | [View Support Matrix](./examples/speculative_decoding/README.md#support-matrix) |
+modelopt は拡散モデルのステップ蒸留・学習不要高速化を対象としていないため、本カテゴリは全て diffusers / tomesd エコシステム側の実装です。
 
-## Deprecation Policy
+| 手法 | 実装 | スクリプト | 実行例 |
+| --- | --- | --- | --- |
+| Progressive Distillation | 自前実装（diffusers） | `progressive_distillation.py` | `python diffusion_distill/progressive_distillation.py --model_path runwayml/stable-diffusion-v1-5 --teacher_steps 32 --num_train_steps 500 --output_dir ./output/sd1.5-progressive-16steps` |
+| LCM (Latent Consistency Model) | 自前実装（diffusers） | `lcm_distillation.py` | `python diffusion_distill/lcm_distillation.py --model_path runwayml/stable-diffusion-v1-5 --num_train_steps 500 --output_dir ./output/sd1.5-lcm` |
+| LCM-LoRA | diffusers（公開LoRAアダプタの適用） | `lcm_lora.py` | `python diffusion_distill/lcm_lora.py --model_path stabilityai/stable-diffusion-xl-base-1.0 --lcm_lora_path latent-consistency/lcm-lora-sdxl --num_inference_steps 4 --output_dir ./output/sdxl-lcm-lora` |
+| ADD（SD-Turbo方式） | 自前実装（diffusers） | `add_distillation.py` | `python diffusion_distill/add_distillation.py --model_path runwayml/stable-diffusion-v1-5 --num_train_steps 500 --output_dir ./output/sd1.5-add-1step` |
+| 高速サンプラー比較 | diffusers標準スケジューラ | `sampler_comparison.py` | `python diffusion_distill/sampler_comparison.py --model_path runwayml/stable-diffusion-v1-5 --steps_list 10,20,50 --output_dir ./output/sd1.5-sampler-comparison` |
+| Token Merging (ToMe) | tomesd | `token_merging.py` | `python diffusion_distill/token_merging.py --model_path runwayml/stable-diffusion-v1-5 --merge_ratio 0.5 --output_dir ./output/sd1.5-tome-50` |
 
-Model Optimizer follows a structured approach to managing deprecated features:
+## 評価軸
 
-- **Communication:** Deprecation notices are documented in the [Changelog](https://nvidia.github.io/Model-Optimizer/reference/0_changelog.html). Deprecated items include source code statements indicating deprecation timing, with runtime warnings issued upon use.
-- **Migration Period:** Since Model Optimizer is still pre-1.0, we provide a 1-release (~1-month) migration period after deprecation. During this window, deprecated features continue functioning while issuing warnings.
-- **Scope:** The policy addresses both complete deprecations (entire APIs removed) and partial ones (specific parameters removed while methods remain).
-- **Removal:** Following the migration period, deprecated elements are removed in alignment with semantic versioning standards, potentially including breaking changes in minor version updates while Model Optimizer remains in 0.x.
+各スクリプトは実行後に `<output_dir>/result.json` として以下を記録します。
 
-## Citation
+- **精度**：LLM は Perplexity（簡易wikitext評価）、拡散モデルは PSNR / CLIP Score / 生成画像
+- **速度**：レイテンシ、トークン/秒 または 画像生成秒数
+- **メモリ**：モデルサイズ(MB)、推論時ピークメモリ(MB)
+- **圧縮率 / スパース率**：元モデル比でのパラメータ数・ファイルサイズ・ゼロ率
 
-If you use NVIDIA Model Optimizer in your research, please cite it as follows:
+## 補足
 
-```bibtex
-@misc{nvidia-modelopt,
-  author       = {{NVIDIA Corporation}},
-  title        = {{NVIDIA Model Optimizer}},
-  howpublished = {\url{https://github.com/NVIDIA/Model-Optimizer}},
-  year         = {2024--2026},
-  note         = {GitHub repository}
-}
-```
+- 共通処理（モデルロード・レイテンシ計測・Perplexity計測・結果保存）は `common/model_utils.py` にまとめてあり、各スクリプトから import して使用します。
+- Wanda / SparseGPT / LLM-Pruner / Depth Pruning / Attention Head Pruning / SmoothQuant / 2:4スパースなど、公式実装が公開されていない、または大規模な手法は、論文アルゴリズムに基づく**簡易実装**です。研究目的で厳密な再現性が必要な場合は、各手法の公式リポジトリの利用も検討してください。
+- 知識蒸留・Progressive Distillation・LCM蒸留・ADD蒸留の学習系スクリプトは、少数ステップでの動作確認を目的とした最小構成です。実運用レベルの品質を得るには、データセット規模・学習ステップ数を大きくする必要があります。
 
-## Contributing
+## ロードマップ
 
-Model Optimizer is now open source! We welcome any feedback, feature requests and PRs.
-Please read our [Contributing](./CONTRIBUTING.md) guidelines for details on how to contribute to this project.
+- [ ] 各モデル×各手法の組み合わせでベンチマークを網羅的に実施し `results/` に集約
+- [ ] vLLM / TensorRT-LLM / ONNX Runtime / TensorRT へのデプロイ検証（共通デプロイ最適化）
+- [ ] 自動最適化パイプライン（精度・速度のトレードオフ探索、Pareto解の自動探索）
 
-## AI Agents
+## ライセンス
 
-ModelOpt's agent skills can be installed from this repository and used in any
-workspace.
+(ライセンスを記載してください)
 
-### Claude Code
+## 貢献
 
-```bash
-claude plugin marketplace add https://github.com/NVIDIA/Model-Optimizer.git
-claude plugin install modelopt@modelopt
-```
-
-### Codex
-
-```bash
-codex plugin marketplace add https://github.com/NVIDIA/Model-Optimizer.git
-```
-
-Then open `/plugins`, select the `modelopt` marketplace, and install `modelopt`.
-Contributors can also use the skills directly from a checkout. See the
-[agent tooling notes](./.agents/TOOLING.md).
-
-### Top Contributors
-
-[![Contributors](https://contrib.rocks/image?repo=NVIDIA/Model-Optimizer)](https://github.com/NVIDIA/Model-Optimizer/graphs/contributors)
-
-Happy optimizing!
+Issue や Pull Request は歓迎します。貢献方法の詳細は `CONTRIBUTING.md`（準備中）を参照してください。
